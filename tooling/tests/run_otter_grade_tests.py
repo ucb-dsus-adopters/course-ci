@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""
+Tier 1 grading gate: run `otter run -a autograder.zip <notebook>` INSIDE base-user-image
+for each staged pair and assert student=0 / solution=full.
+
+This is the required PR gate (matches what xDevs does). The heavier otter-srv-stdalone
+container check (tier 2) reuses tests/otter_grade_common.py with a docker-exec grade_fn.
+
+Usage:
+    python tests/run_otter_grade_tests.py --image <base-user-image:tag>
+"""
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+from otter_grade_common import run_all, score_results
+
+DEFAULT_IMAGE = "us-central1-docker.pkg.dev/cal-icor-hubs/user-images/base-user-image:latest"
+
+
+def make_grade_fn(image: str):
+    def grade(work_dir: Path, notebook_name: str):
+        cmd = [
+            "docker", "run", "--rm", "-u", "root",
+            "-v", f"{work_dir.resolve()}:/work", "-w", "/work",
+            image,
+            "otter", "run", "--no-logo", "-a", "autograder.zip", "-o", "/work", notebook_name,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"otter run exit {result.returncode}\nstderr: {result.stderr[-1500:]}\nstdout: {result.stdout[-500:]}"
+            )
+        results_path = work_dir / "results.json"
+        if not results_path.exists():
+            raise RuntimeError(f"results.json not produced; stdout: {result.stdout[-500:]}")
+        return score_results(results_path)
+
+    return grade
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    args = parser.parse_args()
+    sys.exit(run_all(make_grade_fn(args.image)))
+
+
+if __name__ == "__main__":
+    main()

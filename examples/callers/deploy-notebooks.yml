@@ -1,0 +1,32 @@
+# Copy this to <course-repo>/.github/workflows/deploy-notebooks.yml
+# Identical for every course; per-course config lives in repo variables (see README).
+# The target_repo dispatch input is optional: leave it blank to use vars.DEPLOY_TARGET_REPO,
+# or type an owner/name to override for a single run.
+name: Deploy notebooks
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_changes:
+        description: "If true, sync student_notebooks/ to the target repo and open a PR; otherwise validate only."
+        type: boolean
+        default: false
+      target_repo:
+        description: "Override target repo (owner/name). Blank = use the DEPLOY_TARGET_REPO repo variable."
+        type: string
+        default: ""
+      skip_a11y_checks:
+        description: "Skip accessibility checks (use only for known legacy exceptions)."
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    uses: ucb-dsus-adopters/course-ci/.github/workflows/deploy-notebooks.yml@v1
+    with:
+      ci_ref: v1
+      distributor_app_id: ${{ vars.NOTEBOOK_DISTRIBUTOR_APP_ID }}
+      apply_changes: ${{ inputs.apply_changes }}
+      target_repo: ${{ inputs.target_repo != '' && inputs.target_repo || vars.DEPLOY_TARGET_REPO }}
+      skip_a11y_checks: ${{ inputs.skip_a11y_checks }}
+    secrets: inherit

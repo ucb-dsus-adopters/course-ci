@@ -1,0 +1,19 @@
+# Copy this to <course-repo>/.github/workflows/standalone-grade-check.yml
+# Identical for every course.
+name: Standalone grade check
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "otter-srv-stdalone image to test"
+        type: string
+        default: "gcr.io/data8x-scratch/otter-srv-stdalone:latest"
+
+jobs:
+  standalone-grade:
+    uses: ucb-dsus-adopters/course-ci/.github/workflows/standalone-grade-check.yml@v1
+    with:
+      ci_ref: v1
+      image: ${{ inputs.image }}
+    secrets: inherit

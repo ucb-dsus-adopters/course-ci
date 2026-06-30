@@ -1,0 +1,18 @@
+# Copy this to <course-repo>/.github/workflows/notebook-pipeline.yml
+# Identical for every course; per-course config lives in repo variables:
+#   vars.NOTEBOOK_DISTRIBUTOR_APP_ID   (GitHub App client id)
+#   vars.DEPLOY_TARGET_REPO            (public repo this course deploys to, owner/name)
+# Bump the two `@v1` / `ci_ref: v1` together when adopting a new course-ci release.
+name: Notebook pipeline
+
+on:
+  pull_request_target:
+
+jobs:
+  pipeline:
+    uses: ucb-dsus-adopters/course-ci/.github/workflows/notebook-pipeline.yml@v1
+    with:
+      ci_ref: v1
+      distributor_app_id: ${{ vars.NOTEBOOK_DISTRIBUTOR_APP_ID }}
+      deploy_repo: ${{ vars.DEPLOY_TARGET_REPO }}
+    secrets: inherit

@@ -1,0 +1,19 @@
+# Copy this to <course-repo>/.github/workflows/validate-candidate-image.yml
+# Identical for every course.
+name: Validate candidate base-user-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: "Full candidate image ref (…/base-user-image:TAG). Leave blank to auto-resolve the newest tag."
+        type: string
+        required: false
+
+jobs:
+  validate:
+    uses: ucb-dsus-adopters/course-ci/.github/workflows/validate-candidate-image.yml@v1
+    with:
+      ci_ref: v1
+      image_ref: ${{ inputs.image_ref }}
+    secrets: inherit

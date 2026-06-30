@@ -1,0 +1,100 @@
+name: Standalone grade check (reusable)
+
+# Reusable. Tier 2 (heavier, iterative): grade the committed notebook pairs inside the
+# real otter-srv-stdalone GAR image to confirm its grading stack scores correctly.
+# Tier 1 (otter grade in base-user-image, in notebook-pipeline.yml) is the required PR
+# gate; this is periodic end-to-end validation. The course repo keeps a thin caller.
+#
+# Course content -> ./course, tooling -> ./ci; scripts read COURSE_ROOT (= ./course).
+
+on:
+  workflow_call:
+    inputs:
+      ci_ref:
+        description: "Ref of course-ci to check out for tooling (match the caller's @ref)."
+        type: string
+        default: main
+      image:
+        description: "otter-srv-stdalone image to test"
+        type: string
+        default: "gcr.io/data8x-scratch/otter-srv-stdalone:latest"
+    secrets:
+      GCP_SA_KEY:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  COURSE_ROOT: ${{ github.workspace }}/course
+  CI_TOOLING: ${{ github.workspace }}/ci/tooling
+
+jobs:
+  standalone-grade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: course
+    steps:
+      - name: Checkout course content (committed student/instructor/autograder artifacts)
+        uses: actions/checkout@v6
+        with:
+          path: course
+
+      - name: Checkout course-ci tooling
+        uses: actions/checkout@v6
+        with:
+          repository: ucb-dsus-adopters/course-ci
+          ref: ${{ inputs.ci_ref }}
+          path: ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Authenticate to GCP
+        run: echo '${{ secrets.GCP_SA_KEY }}' > "${HOME}/gcloud-service-key.json"
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Docker for GCR
+        run: |
+          gcloud auth activate-service-account --key-file="${HOME}/gcloud-service-key.json"
+          gcloud auth configure-docker gcr.io --quiet
+
+      - name: Pull and start otter-srv-stdalone
+        run: |
+          docker pull "${{ inputs.image }}"
+          # `otter grade` (run via docker exec) asks the HOST docker daemon to spawn
+          # grading containers that bind-mount the work dir. Mount the docker socket
+          # AND bind /tmp/otterwork at an identical path host<->container so those
+          # nested mounts resolve (docker-out-of-docker path alignment).
+          mkdir -p /tmp/otterwork && chmod 777 /tmp/otterwork
+          docker run -d --name otter-srv-stdalone \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/otterwork:/tmp/otterwork \
+            --entrypoint sleep "${{ inputs.image }}" infinity
+
+      - name: Stage all committed notebook pairs
+        run: python "$CI_TOOLING/tests/fetch_test_notebooks.py" --all
+
+      - name: Grade pairs inside the standalone container
+        run: python "$CI_TOOLING/tests/run_standalone_grade_check.py" --container otter-srv-stdalone
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f otter-srv-stdalone || true
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {"text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ github.repository }} standalone-grade-check ${{ job.status }} · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run #${{ github.run_id }}>"}

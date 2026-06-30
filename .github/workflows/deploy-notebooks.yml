@@ -1,0 +1,153 @@
+name: Deploy notebooks (reusable)
+
+# Reusable. The course repo keeps a thin caller with workflow_dispatch inputs that
+# forwards them here (see README.md). Validates artifacts and runs the a11y check by
+# default; set apply_changes to sync student_notebooks/ to the target repo via a PR
+# (never merges).
+#
+# Course content is checked out to ./course, this repo's tooling to ./ci; scripts read
+# COURSE_ROOT (= ./course).
+
+on:
+  workflow_call:
+    inputs:
+      ci_ref:
+        description: "Ref of course-ci to check out for tooling (match the caller's @ref)."
+        type: string
+        default: main
+      distributor_app_id:
+        description: "Client id of the notebook-distributor GitHub App."
+        type: string
+        required: true
+      apply_changes:
+        description: "If true, sync student_notebooks/ to target_repo and open a PR; otherwise validate only."
+        type: boolean
+        default: false
+      target_repo:
+        description: "Target (public) repo for the student notebooks, owner/name."
+        type: string
+        required: true
+      skip_a11y_checks:
+        description: "Skip accessibility checks (use only for known legacy exceptions)."
+        type: boolean
+        default: false
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: true
+      NOTEBOOK_DISTRIBUTOR_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  COURSE_ROOT: ${{ github.workspace }}/course
+  CI_TOOLING: ${{ github.workspace }}/ci/tooling
+
+jobs:
+  a11y:
+    if: ${{ !inputs.skip_a11y_checks }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: course
+    steps:
+      - name: Checkout course content
+        uses: actions/checkout@v6
+        with:
+          path: course
+
+      - name: Checkout course-ci tooling
+        uses: actions/checkout@v6
+        with:
+          repository: ucb-dsus-adopters/course-ci
+          ref: ${{ inputs.ci_ref }}
+          path: ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Resolve notebook paths
+        id: paths
+        run: |
+          set -euo pipefail
+          files=$(python "$CI_TOOLING/deploy_notebooks.py" --list-notebooks)
+          count=$(wc -w <<< "$files" | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          echo "Notebook count: $count"
+          if [ "$count" -eq 0 ]; then echo "No notebooks found"; exit 1; fi
+
+      # The composite action (berkeley-cdss/jupyterlab-a11y-checker) ships no built
+      # dist, so run the published npm CLI directly instead.
+      - name: Scan notebooks for accessibility issues
+        run: npx --yes -p @jupyterlab-a11y-checker/cli@0.1.6 jupyterlab-a11y-check ${{ steps.paths.outputs.files }}
+
+  deploy:
+    needs: a11y
+    if: ${{ always() && (needs.a11y.result == 'success' || needs.a11y.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: course
+    steps:
+      - name: Checkout course content
+        uses: actions/checkout@v6
+        with:
+          path: course
+
+      - name: Checkout course-ci tooling
+        uses: actions/checkout@v6
+        with:
+          repository: ucb-dsus-adopters/course-ci
+          ref: ${{ inputs.ci_ref }}
+          path: ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Validate artifacts (no writes)
+        if: ${{ !inputs.apply_changes }}
+        run: python "$CI_TOOLING/deploy_notebooks.py"
+
+      - name: Parse target repo owner/name
+        if: ${{ inputs.apply_changes }}
+        id: tgt
+        env:
+          TARGET: ${{ inputs.target_repo }}
+        run: |
+          echo "owner=${TARGET%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${TARGET##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate distributor GitHub App token
+        id: app-token
+        if: ${{ inputs.apply_changes }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.distributor_app_id }}
+          private-key: ${{ secrets.NOTEBOOK_DISTRIBUTOR_PRIVATE_KEY }}
+          owner: ${{ steps.tgt.outputs.owner }}
+          repositories: ${{ steps.tgt.outputs.name }}
+
+      - name: Validate and open downstream PR
+        if: ${{ inputs.apply_changes }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python "$CI_TOOLING/deploy_notebooks.py" --apply --repo "${{ inputs.target_repo }}"
+
+  notify:
+    needs: [a11y, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {"text": "${{ (needs.a11y.result == 'failure' || needs.deploy.result == 'failure') && '❌' || '✅' }} ${{ github.repository }} deploy-notebooks — a11y=${{ needs.a11y.result }}, deploy=${{ needs.deploy.result }}, apply=${{ inputs.apply_changes }} · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run #${{ github.run_id }}>"}

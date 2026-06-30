@@ -1,0 +1,245 @@
+name: Notebook pipeline (reusable)
+
+# Reusable version of the notebook pipeline. The course repo keeps a thin caller that
+# triggers on pull_request_target and calls this workflow (see README.md).
+#
+# On PRs that touch raw notebooks: verify requirement pins are in sync with the deployed
+# base-user-image, regenerate student/solution/autograder artifacts via
+# otter_assign_runner.py (run INSIDE base-user-image), run grader.check + otter grade
+# against the regenerated output, then commit the artifacts back to the PR head.
+#
+# Two checkouts: the course content (PR head) goes to ./course, this repo's tooling goes
+# to ./ci. Scripts read COURSE_ROOT (= ./course) so they operate on course content while
+# living in a separate repo. `git add -A` runs inside ./course, so ./ci is never committed.
+
+on:
+  workflow_call:
+    inputs:
+      ci_ref:
+        description: "Ref of ucb-dsus-adopters/course-ci to check out for tooling. Set this to the same tag the caller pins (e.g. v1)."
+        type: string
+        default: main
+      distributor_app_id:
+        description: "Client id of the notebook-distributor GitHub App (pass vars.NOTEBOOK_DISTRIBUTOR_APP_ID)."
+        type: string
+        required: true
+      deploy_repo:
+        description: "Public materials repo this course deploys to (used only in the post-merge reminder comment)."
+        type: string
+        required: true
+    secrets:
+      GCP_SA_KEY:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+      NOTEBOOK_DISTRIBUTOR_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  # 2i2c infra source of truth for the deployed base-user-image (name + tag).
+  INFRA_VALUES_URL: https://raw.githubusercontent.com/2i2c-org/infrastructure/main/config/clusters/cloudbank/common.values.yaml
+  COURSE_ROOT: ${{ github.workspace }}/course
+  CI_TOOLING: ${{ github.workspace }}/ci/tooling
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: course
+    steps:
+      - name: Generate distributor App token for PR head repo
+        id: dist-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.distributor_app_id }}
+          private-key: ${{ secrets.NOTEBOOK_DISTRIBUTOR_PRIVATE_KEY }}
+          owner: ${{ github.event.pull_request.head.repo.owner.login }}
+          repositories: ${{ github.event.pull_request.head.repo.name }}
+
+      - name: Checkout PR head (course content)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          token: ${{ steps.dist-token.outputs.token }}
+          fetch-depth: 0
+          path: course
+
+      - name: Checkout course-ci tooling
+        uses: actions/checkout@v6
+        with:
+          repository: ucb-dsus-adopters/course-ci
+          ref: ${{ inputs.ci_ref }}
+          path: ci
+
+      - name: Determine if pipeline should run
+        id: gate
+        run: |
+          set -euo pipefail
+          last_email=$(git log -1 --pretty=format:'%ae')
+          last_msg=$(git log -1 --pretty=format:'%s')
+          if echo "$last_email" | grep -q "github-actions\[bot\]" \
+             || echo "$last_msg" | grep -qE '\[skip ci\]|\[ci skip\]'; then
+            echo "Bot push or [skip ci]; skipping to avoid loop."
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          if ! git cat-file -e "$base_sha"; then git fetch origin "$base_sha" --depth=1; fi
+          changed=$(git diff --name-only "$base_sha"...HEAD | grep 'raw_notebooks.*\.ipynb$' || true)
+          if [ -z "$changed" ]; then
+            echo "No raw notebook changes; nothing to do."
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          printf '%s\n' $changed > /tmp/runner_config.txt
+          echo "Changed raw notebooks:"; sed 's/^/  /' /tmp/runner_config.txt
+          { echo "run=true"; echo "list=$(echo $changed | tr '\n' ' ')"; } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check requirement pins are in sync with base-user-image
+        if: steps.gate.outputs.run == 'true'
+        run: python "$CI_TOOLING/tests/check_requirements_sync.py"
+
+      - name: Resolve deployed base-user-image (name + tag)
+        if: steps.gate.outputs.run == 'true'
+        id: image
+        run: |
+          set -euo pipefail
+          pip install pyyaml -q
+          curl -fsSL "$INFRA_VALUES_URL" -o /tmp/infra.yaml
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import yaml, os
+          v = yaml.safe_load(open("/tmp/infra.yaml"))
+          img = v["jupyterhub"]["singleuser"]["image"]
+          print(f"ref={img['name']}:{img['tag']}")
+          EOF
+          echo "Resolved base-user-image: $(grep ^ref= "$GITHUB_OUTPUT" | tail -1)"
+
+      - name: Authenticate to GCP
+        if: steps.gate.outputs.run == 'true'
+        run: echo '${{ secrets.GCP_SA_KEY }}' > "${HOME}/gcloud-service-key.json"
+
+      - name: Set up Google Cloud SDK
+        if: steps.gate.outputs.run == 'true'
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Docker for Artifact Registry
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          gcloud auth activate-service-account --key-file="${HOME}/gcloud-service-key.json"
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Install runner/test dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: pip install nbformat
+
+      - name: Pull base-user-image
+        if: steps.gate.outputs.run == 'true'
+        run: docker pull "${{ steps.image.outputs.ref }}"
+
+      - name: Run otter-assign inside base-user-image
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          chmod -R a+rwX .
+          docker run --rm -u root \
+            -v "$COURSE_ROOT:/work" -w /work \
+            -v "${{ github.workspace }}/ci:/ci" \
+            -v /tmp/runner_config.txt:/tmp/runner_config.txt \
+            "${{ steps.image.outputs.ref }}" \
+            python /ci/tooling/otter_assign_runner.py --all --kernel-name python3 --config /tmp/runner_config.txt --keep-going
+
+      - name: Stage notebook pairs for tests
+        if: steps.gate.outputs.run == 'true'
+        run: python "$CI_TOOLING/tests/fetch_test_notebooks.py" --changed-files "${{ steps.gate.outputs.list }}"
+
+      - name: Run grader.check tests
+        if: steps.gate.outputs.run == 'true'
+        run: python "$CI_TOOLING/tests/run_grader_check_tests.py" --image "${{ steps.image.outputs.ref }}"
+
+      - name: Run otter grade
+        if: steps.gate.outputs.run == 'true'
+        run: python "$CI_TOOLING/tests/run_otter_grade_tests.py" --image "${{ steps.image.outputs.ref }}"
+
+      - name: Commit and push regenerated artifacts
+        if: steps.gate.outputs.run == 'true'
+        id: push
+        run: |
+          set -euo pipefail
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          # otter-assign ran as root inside the container, so the regenerated
+          # artifacts and scratch dirs are root-owned. Reclaim them for the runner
+          # user so cleanup + git add work without permission errors.
+          sudo chown -R "$(id -u):$(id -g)" .
+          rm -rf tests/test_files otterized
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No artifact changes to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git commit -m "ci: otter-assign regenerated artifacts [skip ci]"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          if git push origin "HEAD:${{ github.event.pull_request.head.ref }}"; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment with deploy reminder (push succeeded)
+        if: steps.push.outputs.pushed == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ Otter-assign regenerated artifacts (committed as `ci: otter-assign regenerated artifacts`) and grader.check + otter grade passed.\n\n**After this PR merges**, dispatch the [**Deploy notebooks**](../actions/workflows/deploy-notebooks.yml) workflow to push `student_notebooks/` to `${{ inputs.deploy_repo }}`.'
+            })
+
+      - name: Comment with fallback instructions (push failed)
+        if: steps.push.outputs.committed == 'true' && steps.push.outputs.pushed == 'false'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⚠️ Tests passed and artifacts were regenerated, but pushing back to the PR branch was rejected (often "Allow edits from maintainers" is off on a fork PR).\n\nFix: tick that checkbox, or run `python otter_assign_runner.py --all` locally and commit the result.'
+            })
+
+      - name: Fail if any notebook did not assemble
+        # The runner ran with --keep-going, so notebooks that succeeded were graded
+        # and committed above; surface any that failed here so the job goes red.
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          if [ -s .otter_assign_failures.txt ]; then
+            echo "::error::Some notebooks failed to assemble (others were regenerated/committed):"
+            cat .otter_assign_failures.txt
+            exit 1
+          fi
+          echo "All processed notebooks assembled."
+
+      - name: Notify Slack
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {"text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ github.repository }} notebook-pipeline ${{ job.status }} — ${{ github.head_ref }} · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run #${{ github.run_id }}>"}
