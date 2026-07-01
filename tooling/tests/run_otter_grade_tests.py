@@ -20,7 +20,7 @@ DEFAULT_IMAGE = "us-central1-docker.pkg.dev/cal-icor-hubs/user-images/base-user-
 
 
 def make_grade_fn(image: str):
-    def grade(work_dir: Path, notebook_name: str):
+    def grade(work_dir: Path, notebook_name: str, exclude=frozenset()):
         cmd = [
             "docker", "run", "--rm", "-u", "root",
             "-v", f"{work_dir.resolve()}:/work", "-w", "/work",
@@ -35,7 +35,7 @@ def make_grade_fn(image: str):
         results_path = work_dir / "results.json"
         if not results_path.exists():
             raise RuntimeError(f"results.json not produced; stdout: {result.stdout[-500:]}")
-        return score_results(results_path)
+        return score_results(results_path, exclude)
 
     return grade
 

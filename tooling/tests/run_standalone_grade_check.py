@@ -28,6 +28,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+from otter_grade_common import manual_question_names
+
 # Staged pairs live under the course content tree, not next to this script (tooling is
 # checked out separately in CI). COURSE_ROOT defaults to CWD for local runs.
 COURSE_ROOT = Path(os.environ["COURSE_ROOT"]).resolve() if os.environ.get("COURSE_ROOT") else Path.cwd()
@@ -72,7 +74,7 @@ def _points_from_test_src(src: str) -> float:
     return 1.0
 
 
-def grade_in_container(container: str, assignment: str, role: str, nb: Path, autograder: Path):
+def grade_in_container(container: str, assignment: str, role: str, nb: Path, autograder: Path, exclude=frozenset()):
     """Run `otter grade` in the container; return (earned, possible)."""
     possible, _ = autograder_total_and_tests(autograder)  # fallback total; otter's CSV is authoritative
 
@@ -117,6 +119,18 @@ def grade_in_container(container: str, assignment: str, role: str, nb: Path, aut
     pts_row = next((r for r in rows if r.get("file") == "points-per-question"), None)
     if pts_row and pts_row.get("total_points_earned"):
         possible = float(pts_row["total_points_earned"])
+    # Exclude manual-graded questions: otter grade scores them 0 (they await human
+    # grading), so counting them would cap even the solution below 100%. Subtract each
+    # manual question's column from both earned and possible.
+    for q in exclude:
+        col = next((c for c in sub if c == q or c.split()[0:1] == [q] or c.endswith(f"/{q}")), None)
+        if col:
+            try:
+                earned -= float(sub.get(col) or 0)
+                if pts_row:
+                    possible -= float(pts_row.get(col) or 0)
+            except ValueError:
+                pass
     return earned, possible
 
 
@@ -135,6 +149,9 @@ def main() -> None:
     for assignment in assignments:
         print(f"\n--- {assignment} ---")
         autograder = TEST_FILES_DIR / assignment / "autograder.zip"
+        manual = manual_question_names(assignment)
+        if manual:
+            print(f"  (excluding manual-graded question(s) from score: {', '.join(sorted(manual))})")
         for role, expected_ratio in (("student", 0.0), ("solution", 1.0)):
             nb = TEST_FILES_DIR / assignment / role / f"{assignment}.ipynb"
             if not nb.exists() or not autograder.exists():
@@ -142,7 +159,7 @@ def main() -> None:
                 continue
             print(f"  Grading {role} ({assignment}) with otter grade...")
             try:
-                earned, possible = grade_in_container(args.container, assignment, role, nb, autograder)
+                earned, possible = grade_in_container(args.container, assignment, role, nb, autograder, manual)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{assignment} {role}: {e}")
                 print(f"    [FAIL] {e}")
