@@ -38,6 +38,42 @@ deriving it from their own file location. Because all writes and `git add -A` ha
 `COURSE_ROOT` defaults to the current directory, so every script still works when run by
 hand from inside a course checkout (e.g. `python tooling/tests/fetch_test_notebooks.py --all`).
 
+## Workflows (reference)
+
+Each course repo triggers these via a thin caller in `examples/callers/`.
+
+### `notebook-pipeline.yml` — the required PR gate
+- **Trigger:** caller runs on `pull_request_target` (every PR). Gates to a fast pass unless the PR changed a `raw_notebooks/**.ipynb`.
+- **Does:** checks requirement pins vs the deployed base-user-image → regenerates student/solution/autograder artifacts via `otter_assign_runner.py` (inside the image) → `grader.check` + `otter grade` on the result → commits the regenerated artifacts back to the PR branch → Slack.
+- **Required check name:** `pipeline / pipeline` (set this in branch protection).
+- **Inputs:** `ci_ref`, `distributor_app_id`, `deploy_repo`. **Secrets:** `GCP_SA_KEY`, `SLACK_WEBHOOK_URL`, `NOTEBOOK_DISTRIBUTOR_PRIVATE_KEY` (via `secrets: inherit`).
+
+### `deploy-notebooks.yml` — manual publish to the student repo
+- **Trigger:** `workflow_dispatch`. `apply_changes=false` (default) validates + runs the a11y scan only; `apply_changes=true` opens a PR syncing `student_notebooks/` to `DEPLOY_TARGET_REPO`.
+- **Inputs:** `apply_changes`, `target_repo` (blank ⇒ `DEPLOY_TARGET_REPO`), `skip_a11y_checks`.
+
+### `standalone-grade-check.yml` — manual tier-2 grading
+- **Trigger:** `workflow_dispatch`. Grades the committed pairs inside the real `otter-srv-stdalone` image (end-to-end grading-stack check). **Input:** `image`.
+
+### `validate-candidate-image.yml` — manual pre-deploy image check
+- **Trigger:** `workflow_dispatch`. Does **not** regenerate — it grades the *committed* notebooks against a candidate `base-user-image` to answer "will the deployed notebooks still grade on this image?". **Input:** `image_ref` (blank ⇒ newest tag).
+
+## Tooling scripts (reference)
+
+All read `COURSE_ROOT` (default CWD). Run inside the base-user-image (otter_assign_runner) or on the host (the rest).
+
+| Script | Purpose |
+|---|---|
+| `tooling/otter_assign_runner.py` | Path-routed otter-assign; regenerates student/solution/autograder. Repositions otter's init cell below the H1 (a11y `heading-missing-h1`). |
+| `tooling/deploy_notebooks.py` | Lists notebooks (feeds a11y), validates artifacts, and `--apply` opens the downstream student-repo PR. |
+| `tooling/tests/check_requirements_sync.py` | Fails if requirement pins drift from the base-user-image `environment.yml`. |
+| `tooling/tests/fetch_test_notebooks.py` | Stages student/solution/autograder into `tests/test_files/<assignment>/`. |
+| `tooling/tests/run_grader_check_tests.py` | Tier-1 `grader.check`: solution passes all checks, student fails ≥1. |
+| `tooling/tests/run_otter_grade_tests.py` | Tier-1 `otter grade` in base-user-image; asserts student=0 / solution=full **on auto-graded points** (manual questions excluded via `otter_grade_common.manual_question_names`). |
+| `tooling/tests/run_standalone_grade_check.py` | Tier-2 `otter grade` in the standalone container. |
+| `tooling/tests/otter_grade_common.py` | Shared scoring + manual-question exclusion for both grading tiers. |
+| `tooling/tests/report_image_env.py` | Prints python/package/import versions of an image (used by validate-candidate-image). |
+
 ## What a course repo must provide
 
 Required directory layout (same as materials-fds-private / -v2):
