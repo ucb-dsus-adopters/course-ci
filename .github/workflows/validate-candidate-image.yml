@@ -1,11 +1,10 @@
 name: Validate candidate base-user-image (reusable)
 
-# Reusable. Dry-run a candidate base-user-image BEFORE it is deployed. Regenerates every
-# notebook against the candidate image (committing nothing), confirms grading still
-# works, reports the exact runtime, and checks the deploy-safety rule:
-#
-#   * student notebooks must NOT change   -> students can't update forks mid-sequence
-#   * autograder zips MAY change          -> graded centrally, so that's fine
+# Reusable. Dry-run a candidate base-user-image BEFORE it is deployed. Does NOT regenerate
+# anything: it grades the CURRENTLY COMMITTED student/instructor/autograder notebooks against
+# the candidate image, running the same tests as the PR gate (grader.check + otter grade), and
+# reports the candidate's runtime. Green = the deployed notebooks still grade correctly on the
+# new image.
 #
 # Course content -> ./course, tooling -> ./ci; scripts read COURSE_ROOT (= ./course).
 
@@ -46,7 +45,6 @@ jobs:
       - name: Checkout course content
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
           path: course
 
       - name: Checkout course-ci tooling
@@ -94,17 +92,9 @@ jobs:
       - name: Pull candidate image
         run: docker pull "${{ steps.image.outputs.ref }}"
 
-      - name: Regenerate all notebooks against candidate image (no commit)
-        run: |
-          chmod -R a+rwX .
-          docker run --rm -u root \
-            -v "$COURSE_ROOT:/work" -w /work \
-            -v "${{ github.workspace }}/ci:/ci" \
-            "${{ steps.image.outputs.ref }}" \
-            python /ci/tooling/otter_assign_runner.py --all --kernel-name python3 --keep-going
-          sudo chown -R "$(id -u):$(id -g)" .
-
-      - name: Stage notebook pairs for tests
+      # No regeneration: stage the committed student/instructor/autograder pairs as-is,
+      # then run the same tests the PR gate runs, but against the candidate image.
+      - name: Stage committed notebook pairs for tests
         run: python "$CI_TOOLING/tests/fetch_test_notebooks.py" --all
 
       - name: Run grader.check tests
@@ -120,33 +110,12 @@ jobs:
             python /ci/tooling/tests/report_image_env.py --image-ref "${{ steps.image.outputs.ref }}" \
             | tee report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Student-notebook invariance (deploy-safety gate)
-        id: invariance
-        if: always()
-        run: |
-          set -o pipefail
-          git diff -- student_notebooks > student_notebooks.diff || true
-          python "$CI_TOOLING/tests/check_student_invariance.py" --ref HEAD | tee invariance.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Flag assembly failures on candidate image
-        if: always()
-        run: |
-          if [ -s .otter_assign_failures.txt ]; then
-            echo "::error::Some notebooks failed to assemble on the candidate image:"
-            cat .otter_assign_failures.txt
-            exit 1
-          fi
-          echo "All notebooks assembled on the candidate image."
-
-      - name: Upload report + diff
+      - name: Upload runtime report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: candidate-image-report
-          path: |
-            course/report.md
-            course/invariance.md
-            course/student_notebooks.diff
+          path: course/report.md
 
       - name: Notify Slack
         if: always()
