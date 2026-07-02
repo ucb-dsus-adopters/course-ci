@@ -165,6 +165,13 @@ class OtterAssignRunner:
             # reference it (grader.check, grader.check_all, grader.export, a bare
             # grader) raise NameError. Skip them here by temporarily tagging them
             # with otter_ignore, then strip the temp tag before writing back.
+            #
+            # Cells the author tagged `skip-execution` (e.g. live-API/LLM calls that
+            # can't run headless) must also be skipped here. nbclient would honor
+            # `skip-execution` on its own, but we override its skip trait to
+            # `otter_ignore` below — so fold those cells into the same temp tag. The
+            # author's `skip-execution` tag is left in place so otter assign skips
+            # them too; only the temp otter_ignore is stripped afterward.
             temp_tagged = []
             if self.wrap_otter_ignore:
                 for cell in nb.cells:
@@ -172,7 +179,8 @@ class OtterAssignRunner:
                         continue
                     src = cell.get("source", "")
                     text = "".join(src) if isinstance(src, list) else str(src)
-                    if re.search(r"\bgrader\b", text):
+                    existing_tags = cell.get("metadata", {}).get("tags", []) or []
+                    if re.search(r"\bgrader\b", text) or "skip-execution" in existing_tags:
                         tags = cell.setdefault("metadata", {}).setdefault("tags", [])
                         if "otter_ignore" not in tags:
                             tags.append("otter_ignore")
@@ -390,10 +398,67 @@ class OtterAssignRunner:
         except Exception as e:
             logger.warning(f"Could not relocate outputs for {notebook.name}: {e}")
 
+    def _has_questions(self, notebook: Path) -> bool:
+        """True if the notebook declares at least one otter question (# BEGIN QUESTION).
+
+        otter assign requires >=1 question (it errors on ./source/tests otherwise), so a
+        notebook without any is treated as instructional and published as-is via
+        copy_through() instead of being assigned.
+        """
+        try:
+            nb = nbformat.read(str(notebook), as_version=4)
+        except Exception:
+            return True  # unreadable: take the assign path so the real error surfaces
+        for c in nb.cells:
+            src = c.get("source", "")
+            text = "".join(src) if isinstance(src, list) else str(src)
+            if re.search(r"(?m)^#\s*BEGIN QUESTION\b", text):
+                return True
+        return False
+
+    def copy_through(self, notebook: Path) -> None:
+        """Publish an instructional (question-less) notebook as-is.
+
+        Copies the notebook + its sibling data files into student_notebooks/ (outputs
+        cleared) and instructor_notebooks/. No autograder is produced, and the notebook
+        is NOT executed (so cells that need a network/API/key at runtime don't fail CI).
+        """
+        ntype, assignment = self._resolve_meta(notebook)
+        src_folder = notebook.parent
+        for dest_root, clear in ((STUDENT_DIR, True), (SOLUTION_DIR, False)):
+            dest = self.repo_root / dest_root / ntype / assignment
+            if dest.exists():
+                _rmtree_force(dest)
+            dest.mkdir(parents=True, exist_ok=True)
+            for item in src_folder.iterdir():
+                if item.is_dir() or item.name.startswith("."):
+                    continue
+                shutil.copy2(item, dest / item.name)
+            dst_nb = dest / f"{assignment}.ipynb"
+            copied = dest / notebook.name
+            if copied.exists() and copied != dst_nb:
+                if dst_nb.exists():
+                    dst_nb.unlink()
+                copied.rename(dst_nb)
+            if clear:
+                nb = nbformat.read(str(dst_nb), as_version=4)
+                for c in nb.cells:
+                    if c.cell_type == "code":
+                        c.outputs = []
+                        c.execution_count = None
+                nbformat.write(nb, str(dst_nb))
+        logger.info(f"Copied through (no otter questions) -> {ntype}/{assignment}")
+
     # ------------------------------------------------------------------ #
     # Orchestration
     # ------------------------------------------------------------------ #
     def run_one(self, notebook: Path) -> Tuple[Path, bool, str]:
+        if not self._has_questions(notebook):
+            try:
+                self.copy_through(notebook)
+                return notebook, True, "copied through (no otter questions)"
+            except Exception as e:
+                return notebook, False, f"copy-through failed: {e}"
         scratch_out = self._scratch_out_dir(notebook)
         try:
             ok, msg = self.execute_notebook(notebook)
