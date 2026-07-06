@@ -37,6 +37,10 @@ TEST_FILES_DIR = COURSE_ROOT / "tests" / "test_files"
 # Must match the host:container bind mount in standalone-grade-check.yml.
 WORK_ROOT = Path("/tmp/otterwork")
 
+# Cap a single grade so a headless-hanging cell can't stall CI for hours (see
+# run_otter_grade_tests.py). A legitimate grade takes ~1-2 min.
+GRADE_TIMEOUT_SECONDS = 600
+
 
 def autograder_total_and_tests(autograder_zip: Path):
     """Return (total_points, [test_names]) by reading the zip's tests/*.py.
@@ -98,7 +102,19 @@ def grade_in_container(container: str, assignment: str, role: str, nb: Path, aut
         "-o", str(out),
         str(subs),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    # Bound the grade: a headless-hanging cell (interactive widget, no-timeout network
+    # call) would otherwise block otter grade indefinitely and stall CI for hours.
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=GRADE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "exec", container, "pkill", "-f", "otter grade"],
+                       capture_output=True, text=True)
+        raise RuntimeError(
+            f"otter grade timed out after {GRADE_TIMEOUT_SECONDS}s grading {assignment} ({role}) "
+            f"— a cell likely hangs headless (an interactive widget such as `interact(...)`, or a "
+            f"network call with no timeout whose egress CI drops). Tag the offending cell "
+            f"`skip-execution`."
+        )
     if res.returncode != 0:
         raise RuntimeError(
             f"otter grade exit {res.returncode}\nstderr: {res.stderr[-1500:]}\nstdout: {res.stdout[-500:]}"
