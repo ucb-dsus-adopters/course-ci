@@ -1,0 +1,191 @@
+name: Regenerate notebooks against a candidate image (reusable)
+
+# Reusable. Re-seed the notebooks against a specific base-user-image tag: run otter-assign
+# INSIDE that image (so autograder test outputs are re-seeded to the image's reprs), then run
+# the same gates as the PR pipeline (grader.check + otter grade) against it. If EVERYTHING
+# passes, open a PR with the regenerated artifacts — its body and the Slack message both warn
+# that the deployed base-user-image tag must be updated to this candidate BEFORE the notebooks
+# are deployed (otherwise the next notebook-pipeline run regenerates against the old deployed
+# image and reverts these). If any assemble/test fails, no PR is opened and Slack reports it.
+#
+# Course content -> ./course, tooling -> ./ci; scripts read COURSE_ROOT (= ./course).
+
+on:
+  workflow_call:
+    inputs:
+      ci_ref:
+        description: "Ref of course-ci to check out for tooling (match the caller's @ref)."
+        type: string
+        default: main
+      image_ref:
+        description: "Full candidate image ref (…/base-user-image:TAG) to regenerate against. Leave blank to auto-resolve the newest tag."
+        required: false
+        type: string
+    secrets:
+      GCP_SA_KEY:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  IMAGE_REPO: us-central1-docker.pkg.dev/cal-icor-hubs/user-images/base-user-image
+  COURSE_ROOT: ${{ github.workspace }}/course
+  CI_TOOLING: ${{ github.workspace }}/ci/tooling
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: course
+    steps:
+      - name: Checkout course content
+        uses: actions/checkout@v6
+        with:
+          path: course
+
+      - name: Checkout course-ci tooling
+        uses: actions/checkout@v6
+        with:
+          repository: ucb-dsus-adopters/course-ci
+          ref: ${{ inputs.ci_ref }}
+          path: ci
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install host dependencies
+        run: pip install nbformat
+
+      - name: Authenticate to GCP
+        run: echo '${{ secrets.GCP_SA_KEY }}' > "${HOME}/gcloud-service-key.json"
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth activate-service-account --key-file="${HOME}/gcloud-service-key.json"
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Resolve candidate image
+        id: image
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.image_ref }}" ]; then
+            ref="${{ inputs.image_ref }}"
+          else
+            tag=$(gcloud artifacts docker images list "$IMAGE_REPO" \
+                    --include-tags --sort-by=~UPDATE_TIME --limit=1 \
+                    --format='value(tags)' 2>/dev/null | tr ',' '\n' | grep -v '^$' | head -1)
+            if [ -z "$tag" ]; then
+              echo "::error::Could not auto-resolve a tag; pass image_ref explicitly."; exit 1
+            fi
+            ref="$IMAGE_REPO:$tag"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "tag=${ref##*:}" >> "$GITHUB_OUTPUT"
+          echo "Candidate image: $ref"
+
+      - name: Pull candidate image
+        run: docker pull "${{ steps.image.outputs.ref }}"
+
+      - name: Regenerate notebooks inside candidate image
+        run: |
+          chmod -R a+rwX .
+          docker run --rm -u root \
+            -v "$COURSE_ROOT:/work" -w /work \
+            -v "${{ github.workspace }}/ci:/ci" \
+            "${{ steps.image.outputs.ref }}" \
+            python /ci/tooling/otter_assign_runner.py --all --kernel-name python3 --keep-going
+          sudo chown -R "$(id -u):$(id -g)" .
+
+      - name: Fail if any notebook did not assemble
+        run: |
+          if [ -s .otter_assign_failures.txt ]; then
+            echo "::error::Some notebooks failed to assemble against ${{ steps.image.outputs.ref }}:"
+            cat .otter_assign_failures.txt
+            exit 1
+          fi
+          echo "All notebooks assembled against the candidate image."
+
+      - name: Stage regenerated pairs for tests
+        run: python "$CI_TOOLING/tests/fetch_test_notebooks.py" --all
+
+      - name: Run grader.check tests
+        run: python "$CI_TOOLING/tests/run_grader_check_tests.py" --image "${{ steps.image.outputs.ref }}"
+
+      - name: Run otter grade
+        run: python "$CI_TOOLING/tests/run_otter_grade_tests.py" --image "${{ steps.image.outputs.ref }}"
+
+      # Everything above passed → open a PR with the regenerated artifacts. The body warns that
+      # the deployed image tag must be bumped to this candidate BEFORE deploying the notebooks.
+      - name: Open regeneration PR
+        if: success()
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.image.outputs.ref }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf tests/test_files otterized
+          branch="ci/regenerate-${TAG}-${{ github.run_id }}"
+          git checkout -B "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Notebooks already match ${REF}; nothing to regenerate."
+            echo "opened=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git commit -m "ci: regenerate notebooks against ${REF} [skip ci]"
+          git push -f origin "$branch"
+          {
+            printf '%s\n\n' "Regenerated \`student_notebooks/\`, \`instructor_notebooks/\`, and \`autograder_zips/\` against candidate image \`${REF}\`. **grader.check + otter grade passed** on that image, so the notebooks grade correctly there."
+            printf '%s\n' "> [!WARNING]"
+            printf '%s\n' "> **Update the deployed base-user-image tag to \`${TAG}\` BEFORE deploying these notebooks.**"
+            printf '%s\n' ">"
+            printf '%s\n\n' "> These tests are now seeded to \`${REF}\`'s output reprs. If you deploy the notebooks while an older image is still deployed, the next \`notebook-pipeline\` run regenerates against the *deployed* image and reverts this. Correct order: **(1)** merge this PR, **(2)** update the deployed base-user-image tag to \`${TAG}\`, **(3)** dispatch **Deploy notebooks**."
+            printf '%s\n' "Generated by the Regenerate workflow · run #${{ github.run_id }}."
+          } > /tmp/pr_body.md
+          url=$(gh pr create \
+            --title "ci: regenerate notebooks for base-user-image ${TAG}" \
+            --body-file /tmp/pr_body.md \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$branch")
+          echo "opened=true" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "PR: $url"
+
+      - name: Notify Slack (regenerated → PR opened)
+        if: success() && steps.pr.outputs.opened == 'true'
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {"text": "✅ Regenerated + all tests pass on `${{ steps.image.outputs.ref }}` — review <${{ steps.pr.outputs.url }}|the PR>. ⚠️ Update the deployed base-user-image tag to `${{ steps.image.outputs.tag }}` BEFORE deploying these notebooks. · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run #${{ github.run_id }}>"}
+
+      - name: Notify Slack (already up to date)
+        if: success() && steps.pr.outputs.opened != 'true'
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {"text": "✅ Notebooks already match `${{ steps.image.outputs.ref }}`; nothing to regenerate. · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run #${{ github.run_id }}>"}
+
+      - name: Notify Slack (failed)
+        if: failure()
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {"text": "❌ Regeneration/tests failed for `${{ steps.image.outputs.ref }}` — review needed (do NOT deploy). · <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run #${{ github.run_id }}>"}
