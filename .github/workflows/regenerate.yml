@@ -92,6 +92,18 @@ jobs:
           echo "tag=${ref##*:}" >> "$GITHUB_OUTPUT"
           echo "Candidate image: $ref"
 
+      # The base-user-image is ~16GB and grading every pair writes a lot; a hosted runner's
+      # ~14GB free space runs out mid-`otter grade` (ENOSPC). Reclaim the preinstalled
+      # toolchains we don't use before pulling the image.
+      - name: Free disk space
+        run: |
+          echo "Before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/share/powershell /usr/share/swift "${AGENT_TOOLSDIRECTORY:-}" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "After:"; df -h / | tail -1
+
       - name: Pull candidate image
         run: docker pull "${{ steps.image.outputs.ref }}"
 
