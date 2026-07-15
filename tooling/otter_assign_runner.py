@@ -323,6 +323,10 @@ class OtterAssignRunner:
             source_zip = max(zips, key=lambda p: p.stat().st_mtime)
             dest_dir = self.repo_root / AUTOGRADER_ZIPS_DIR / ntype / assignment
             dest_dir.mkdir(parents=True, exist_ok=True)
+            # Prune stale zips first, e.g. previously committed timestamped copies like
+            # <assignment>-autograder_2026_01_12T....zip, so only the canonical name remains.
+            for old in dest_dir.glob("*.zip"):
+                old.unlink()
             dest = dest_dir / f"{assignment}-autograder.zip"
             # Copy otter's zip as-is (keeps its real build timestamps); only the
             # filename is canonicalized so tooling can find <assignment>-autograder.zip.

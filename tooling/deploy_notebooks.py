@@ -118,21 +118,24 @@ def apply(target_repo: str, branch: str, base_branch: str) -> None:
             print(f"No changes for {target_repo}; nothing to PR.")
             return
 
+        # Label the deploy after the SOURCE repo, not a hardcoded course, so a v1 deploy
+        # doesn't say "materials-fds-v2".
+        src_repo = os.environ.get("GITHUB_REPOSITORY", "materials-fds-private-v2")
+        src_name = src_repo.split("/")[-1]
         run(["git", "-C", str(dest), "checkout", "-b", branch])
         run(["git", "-C", str(dest), "add", "-A"])
-        run(["git", "-C", str(dest), "commit", "-m", f"materials-fds-v2 deploy: student notebooks ({branch})"])
+        run(["git", "-C", str(dest), "commit", "-m", f"deploy: student notebooks from {src_name} ({branch})"])
         run(["git", "-C", str(dest), "push", "-u", "origin", branch],
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
         run_id = os.environ.get("GITHUB_RUN_ID", "local")
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
-        src_repo = os.environ.get("GITHUB_REPOSITORY", "materials-fds-private-v2")
         body = (
             f"Automated sync of `student_notebooks/` from [{src_repo}](https://github.com/{src_repo}).\n\n"
             f"Workflow run: {server}/{src_repo}/actions/runs/{run_id}\n"
         )
         run(["gh", "pr", "create", "--repo", target_repo, "--base", base_branch,
-             "--head", branch, "--title", "materials-fds-v2 deploy: student notebooks", "--body", body],
+             "--head", branch, "--title", f"deploy: student notebooks from {src_name}", "--body", body],
             env={**os.environ, "GH_TOKEN": token})
 
 
@@ -154,7 +157,8 @@ def main() -> None:
         print("Validate-only mode (no --apply): not syncing.")
         return
 
-    branch = args.branch or f"materials-fds-v2-deploy-{os.environ.get('GITHUB_RUN_ID', 'local')}"
+    src_name = os.environ.get("GITHUB_REPOSITORY", "course").split("/")[-1]
+    branch = args.branch or f"{src_name}-deploy-{os.environ.get('GITHUB_RUN_ID', 'local')}"
     apply(args.repo, branch, args.base_branch)
 
 
