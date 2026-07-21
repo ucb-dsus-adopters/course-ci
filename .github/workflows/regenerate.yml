@@ -21,6 +21,11 @@ on:
         description: "Full candidate image ref (…/base-user-image:TAG) to regenerate against. Leave blank to auto-resolve the newest tag."
         required: false
         type: string
+      notebook:
+        description: "Regenerate only this assignment (e.g. 'hw/hw12'); blank = all notebooks. Scopes the regenerate + grader.check + otter grade to just that pair."
+        required: false
+        type: string
+        default: ""
       distributor_app_id:
         description: "Client id of the notebook-distributor GitHub App (vars.NOTEBOOK_DISTRIBUTOR_APP_ID), used to open the PR since the org blocks GITHUB_TOKEN from creating PRs."
         required: false
@@ -117,11 +122,19 @@ jobs:
       - name: Regenerate notebooks inside candidate image
         run: |
           chmod -R a+rwX .
+          # A single-assignment scope (e.g. notebook=hw/hw12) regenerates just that pair;
+          # blank regenerates everything. Same runner either way (it already supports both).
+          if [ -n "${{ inputs.notebook }}" ]; then
+            scope="--notebook ${{ inputs.notebook }}"
+            echo "Regenerating only: ${{ inputs.notebook }}"
+          else
+            scope="--all"
+          fi
           docker run --rm -u root \
             -v "$COURSE_ROOT:/work" -w /work \
             -v "${{ github.workspace }}/ci:/ci" \
             "${{ steps.image.outputs.ref }}" \
-            python /ci/tooling/otter_assign_runner.py --all --kernel-name python3 --keep-going
+            python /ci/tooling/otter_assign_runner.py $scope --kernel-name python3 --keep-going
           sudo chown -R "$(id -u):$(id -g)" .
 
       - name: Fail if any notebook did not assemble
@@ -134,7 +147,16 @@ jobs:
           echo "All notebooks assembled against the candidate image."
 
       - name: Stage regenerated pairs for tests
-        run: python "$CI_TOOLING/tests/fetch_test_notebooks.py" --all
+        run: |
+          # Scope the test staging (and therefore grader.check + otter grade) to the same
+          # assignment when notebook= is set, so a single-assignment run stays fast.
+          if [ -n "${{ inputs.notebook }}" ]; then
+            nb="${{ inputs.notebook }}"
+            python "$CI_TOOLING/tests/fetch_test_notebooks.py" \
+              --changed-files "raw_notebooks/${nb}/$(basename "$nb").ipynb"
+          else
+            python "$CI_TOOLING/tests/fetch_test_notebooks.py" --all
+          fi
 
       - name: Run grader.check tests
         run: python "$CI_TOOLING/tests/run_grader_check_tests.py" --image "${{ steps.image.outputs.ref }}"
