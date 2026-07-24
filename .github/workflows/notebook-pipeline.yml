@@ -147,6 +147,18 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: pip install nbformat
 
+      - name: Free disk space
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          # base-user-image is ~16 GB; the default runner disk fills unpacking it
+          # ("no space left on device"). Reclaim space first, same as regenerate.yml.
+          echo "Before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/share/powershell /usr/share/swift "${AGENT_TOOLSDIRECTORY:-}" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "After:"; df -h / | tail -1
+
       - name: Pull base-user-image
         if: steps.gate.outputs.run == 'true'
         run: docker pull "${{ steps.image.outputs.ref }}"
