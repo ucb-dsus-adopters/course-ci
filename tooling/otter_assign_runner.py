@@ -31,6 +31,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -58,6 +59,31 @@ SOLUTION_DIR = "instructor_notebooks"
 STUDENT_DIR = "student_notebooks"
 AUTOGRADER_ZIPS_DIR = "autograder_zips"
 SCRATCH_DIR = "otterized"
+
+# Packages whose exact version changes graded-output reprs: numpy 2.x scalar reprs,
+# datascience's legacy printing, and (decisively) the ipykernel/IPython per-cell
+# contextvars behavior that decides whether datascience's legacy setting survives a
+# cell boundary (ipykernel 7.0.1 resets it -> np.True_; 7.3.0 keeps it -> True). The
+# autograder zip's grading env is rebuilt FROM scratch (FROM ubuntu:22.04 + the zip's
+# environment.yml) by `otter grade` / otter-service-standalone, so if these float they
+# can diverge from the versions that SEEDED the tests -> np.True_ vs True mismatches ->
+# correct solutions grade <100%. We pin them to the versions of THIS interpreter -- the
+# one running otter assign, i.e. the base-user-image in CI -- so the grade env matches
+# the seed env by construction and cannot drift. See memory base-image-numpy-repr-ipykernel.
+FREEZE_TO_SEED_ENV = (
+    "ipython", "ipykernel", "numpy", "pandas", "matplotlib", "datascience",
+    "traitlets", "nbclient", "nbconvert", "nbformat", "ipywidgets", "jupyter_client",
+)
+
+
+def _canonical(name: str) -> str:
+    """PEP 503-ish normalization so 'jupyter_client' == 'jupyter-client'."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+def _pip_req_name(entry: str) -> str:
+    """'otter-grader[grading,plugins]==6.1.6' -> 'otter-grader'."""
+    return re.split(r"[<>=!~;\[\s]", str(entry).strip(), maxsplit=1)[0]
 
 
 def _rmtree_force(path: Path) -> None:
@@ -331,9 +357,81 @@ class OtterAssignRunner:
             # Copy otter's zip as-is (keeps its real build timestamps); only the
             # filename is canonicalized so tooling can find <assignment>-autograder.zip.
             shutil.copy2(source_zip, dest)
+            # Pin the grading env to this (seed) interpreter's versions so the tests
+            # can't grade against a drifted numpy/ipykernel later. See _freeze_env_versions.
+            self._freeze_env_versions(dest)
             logger.info(f"Autograder zip -> {dest.relative_to(self.repo_root)}")
         except Exception as e:
             logger.warning(f"Could not copy autograder zip for {notebook.name}: {e}")
+
+    def _freeze_env_versions(self, zip_path: Path) -> None:
+        """Rewrite the autograder zip's environment.yml, pinning the repr-affecting
+        packages (FREEZE_TO_SEED_ENV) to the versions installed in THIS interpreter --
+        the env that ran otter assign and seeded the tests (the base-user-image in CI).
+
+        The grading container `otter grade` / otter-service-standalone builds is created
+        fresh from this environment.yml, so pinning here makes seed env == grade env by
+        construction: numpy/datascience/ipykernel can't resolve to newer versions at
+        grade time and flip reprs (np.True_ vs True). Only these packages are pinned --
+        the env stays otherwise as otter generated it (otter-grader's own pin, channels,
+        python). Best-effort: any failure leaves the zip untouched and is logged."""
+        try:
+            import yaml  # PyYAML ships with otter-grader; guarded just in case
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"PyYAML unavailable; not freezing env for {zip_path.name}: {e}")
+            return
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+                if "environment.yml" not in names:
+                    logger.warning(f"{zip_path.name}: no environment.yml; skipping env freeze")
+                    return
+                infos = {i.filename: i for i in zf.infolist()}
+                blobs = {n: zf.read(n) for n in names}
+
+            # Versions from the current (seed) interpreter, skipping anything not installed.
+            want = {}
+            for pkg in FREEZE_TO_SEED_ENV:
+                for cand in (pkg, pkg.replace("_", "-")):
+                    try:
+                        want[pkg] = version(cand)
+                        break
+                    except PackageNotFoundError:
+                        continue
+            if not want:
+                logger.warning(f"{zip_path.name}: none of the freeze packages found; skipping")
+                return
+            frozen = {_canonical(p) for p in want}
+
+            env = yaml.safe_load(blobs["environment.yml"].decode("utf-8")) or {}
+            deps = env.get("dependencies") or []
+            pip_container = next((d for d in deps if isinstance(d, dict) and "pip" in d), None)
+            if pip_container is None:
+                pip_container = {"pip": []}
+                deps.append(pip_container)
+                env["dependencies"] = deps
+            existing = pip_container.get("pip") or []
+            # Keep every pip entry except the ones we're about to re-pin (e.g. otter-grader
+            # and any non-freeze deps stay exactly as otter emitted them).
+            kept = [e for e in existing if _canonical(_pip_req_name(e)) not in frozen]
+            pinned = [f"{p}=={want[p]}" for p in FREEZE_TO_SEED_ENV if p in want]
+            pip_container["pip"] = kept + pinned
+
+            new_yaml = yaml.safe_dump(env, sort_keys=False, default_flow_style=False).encode("utf-8")
+
+            # zipfile can't edit a member in place: rewrite the archive with the patch.
+            tmp = zip_path.with_name(zip_path.name + ".tmp")
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                for n in names:
+                    zf.writestr(infos[n], new_yaml if n == "environment.yml" else blobs[n])
+            tmp.replace(zip_path)
+            logger.info(
+                f"Froze grading env to seed versions in {zip_path.name}: "
+                + ", ".join(f"{p}=={want[p]}" for p in FREEZE_TO_SEED_ENV if p in want)
+            )
+        except Exception as e:
+            logger.warning(f"Could not freeze env versions in {zip_path.name}: {e}")
 
     # ------------------------------------------------------------------ #
     # Relocate outputs to instructor_notebooks / student_notebooks
