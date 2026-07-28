@@ -220,7 +220,7 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '✅ Otter-assign regenerated artifacts (committed as `ci: otter-assign regenerated artifacts`) and grader.check + otter grade passed.\n\n**After this PR merges**, dispatch the [**Deploy notebooks**](../actions/workflows/deploy-notebooks.yml) workflow to push `student_notebooks/` to `${{ inputs.deploy_repo }}`.'
+              body: '✅ Otter-assign regenerated artifacts (committed as `ci: otter-assign regenerated artifacts`) and grader.check + otter grade passed.\n\n**After this PR merges**, dispatch the [**Deploy notebooks**](${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy-notebooks.yml) workflow to push `student_notebooks/` to `${{ inputs.deploy_repo }}`.'
             })
 
       - name: Comment with fallback instructions (push failed)
